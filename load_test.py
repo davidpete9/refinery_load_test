@@ -129,10 +129,11 @@ async def start_testing():
     await t.init_connections()
 
     for l in load_profile:
+        print('Running load profile: {} {}'.format(l['time_wait'],l['itherations']))
         for i in range(0, l['itherations']):
             t.send_message_everywhere()
             await asyncio.sleep(l['time_wait'])
-
+    print('DONE')
     await asyncio.sleep(5)
     for c in t.connections:
         await c.get_connection().close()
