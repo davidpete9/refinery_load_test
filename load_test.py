@@ -32,12 +32,18 @@ class ConnectionHandler:
         self.state_id = "-80000000"
         self.fulltext_prob = fulltext_prob
         self.log = dict()
+        self.is_closed = False
+        self.close_reason = 'active'
 
         self.cnt = 0
         self.message_cnt = 0
 
     def get_connection(self):
         return self.conn
+
+    async def close_connection(self):
+        await self.conn.close()
+        self.is_closed = True
 
     def get_next_message(self, is_first_message=False):
         new_id = uuid.uuid1().hex
@@ -55,6 +61,8 @@ class ConnectionHandler:
         return dict(id=new_id, request=to_send)
 
     async def send_message(self):
+        if self.is_closed:
+            return
         next_message = self.get_next_message(False if self.cnt != 0 else True)
 
         self.log[next_message['id']] = dict(cnt=self.cnt)
@@ -65,10 +73,14 @@ class ConnectionHandler:
             print(next_message)
         except ConnectionClosedOK as e:
             print('Connection closed ok {}'.format(e.reason))
-            self.log[next_message['id']]['state'] = 'Rejected'
+            self.close_reason = 'server_closed'
+            self.log[next_message['id']]['state'] = 'server_closed'
+            self.is_closed = True
         except ConnectionClosedError as e:
             print('Connection closed error {}'.format(e.reason))
-            self.log[next_message['id']]['state'] = 'ClientErr'
+            self.is_closed = True
+            self.close_reason = 'client_closed'
+            self.log[next_message['id']]['state'] = 'client_closed'
         finally:
             self.log[next_message['id']]['sent_at'] = time.time()
 
@@ -99,16 +111,26 @@ class ConnectionHandler:
 
 class StressTester:
 
-    async def init_connections(self):
-        for i in range(0, self.conn_count):
+    async def init_connections(self, conn_num):
+        for i in range(0, conn_num):
             conn = await websockets.connect(self.url,
                                             subprotocols=['tools.refinery.language.web.xtext.v1'])
-            conn_handler = ConnectionHandler(conn, i)
+            ind = len(self.connections)+1
+            conn_handler = ConnectionHandler(conn, ind)
             self.connections.append(conn_handler)
             # Start async process to receive all messages of this connection.
             asyncio.create_task(conn_handler.consumer_handler())
 
-    def __init__(self, ws_url, num_of_connections, full_text_prob=0.1, max_diff_words=10):
+    async def update_connection_num(self, conn_num):
+        if conn_num < self.conn_count:
+            to_close = self.conn_count-conn_num
+            for i in range(0, to_close):
+                await self.connections[i].close_connection()
+        if self.conn_count < conn_num:
+            await self.init_connections(conn_num-self.conn_count)
+        self.conn_count = conn_num
+
+    def __init__(self, ws_url, num_of_connections):
         self.url = ws_url
         self.conn_count = num_of_connections
         self.connections = []
@@ -121,33 +143,49 @@ class StressTester:
 WS_URL = 'wss://xtext.test.refinery.services/xtext-service'
 
 
-load_profile = [dict(time_wait=1, itherations=1),dict(time_wait=0.5, itherations=0)]
+load_profile = [dict(time_wait=1, itherations=1, conns=1),dict(time_wait=0.5, itherations=1, conns=2)]
+
+
+def get_stats(handlers):
+    open_num = 0
+    server_closed = 0
+    client_closed = 0
+    for h in handlers:
+        if not h.is_closed:
+            open_num += 1
+        elif h.close_reason == 'server_closed':
+            server_closed += 1
+        elif h.close_reason == 'client_closed':
+            client_closed += 1
+    print(f'active: {open_num}, client_closed: {client_closed}, server_closed: {server_closed}')
 
 
 async def start_testing():
-    t = StressTester(WS_URL, [], 1)
-    await t.init_connections()
-
+    t = StressTester(WS_URL, 0)
     for l in load_profile:
-        print('Running load profile: {} {}'.format(l['time_wait'],l['itherations']))
+        print('Running load profile: time_between = {}  itherations = {} conns =  {}'.format(l['time_wait'],l['itherations'], l['conns']))
+        await t.update_connection_num(l['conns'])
         for i in range(0, l['itherations']):
             t.send_message_everywhere()
             await asyncio.sleep(l['time_wait'])
+            if i % 50 == 0:
+                get_stats(t.connections)
     print('DONE')
-    await asyncio.sleep(5)
+    get_stats(t.connections)
     for c in t.connections:
         await c.get_connection().close()
-        with open(f'stats/{c.conn_id}.csv','w+') as f:
-            f.write('\n'.join([';'.join(
-                      [
-                      str(c.log[key]['cnt']),
-                      str(c.log[key]['sent_at']),
-                      str((c.log[key]['response_at'] if 'response_at' in c.log[key] else c.log[key]['sent_at'])-c.log[key]['sent_at']),
-                      str(c.log[key]['state']),
-                      str(c.log[key]['resp_cnt']),
-                      str(c.log[key]['resp_size'])
-                      ])
-                      for key in c.log]))
+        #with open(f'stats/{c.conn_id}.csv','w+') as f:
+        #    f.write('\n'.join([';'.join(
+        #              [
+        #              str(c.log[key]['cnt']),
+        #              str(c.log[key]['sent_at']),
+        #              str((c.log[key]['response_at'] if 'response_at' in c.log[key] else c.log[key]['sent_at'])-c.log[key]['sent_at']),
+        #              str(c.log[key]['state']),
+        #              str(c.log[key]['resp_cnt']),
+        #              str(c.log[key]['resp_size'])
+        #              ])
+        #              for key in c.log]))
+
 
 
 asyncio.run(start_testing())
