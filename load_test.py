@@ -101,14 +101,14 @@ class StressTester:
 
     async def init_connections(self):
         for i in range(0, self.conn_count):
-            conn = await websockets.connect(self.url, logger=logger,
+            conn = await websockets.connect(self.url,
                                             subprotocols=['tools.refinery.language.web.xtext.v1'])
             conn_handler = ConnectionHandler(conn, i)
             self.connections.append(conn_handler)
             # Start async process to receive all messages of this connection.
             asyncio.create_task(conn_handler.consumer_handler())
 
-    def __init__(self, ws_url, load_profile, num_of_connections, full_text_prob=0.1, max_diff_words=10):
+    def __init__(self, ws_url, num_of_connections, full_text_prob=0.1, max_diff_words=10):
         self.url = ws_url
         self.conn_count = num_of_connections
         self.connections = []
@@ -121,21 +121,32 @@ class StressTester:
 WS_URL = 'wss://xtext.test.refinery.services/xtext-service'
 
 
+load_profile = [dict(time_wait=1, itherations=1),dict(time_wait=0.5, itherations=0)]
+
+
 async def start_testing():
-    t = StressTester(WS_URL, [], 60)
+    t = StressTester(WS_URL, [], 1)
     await t.init_connections()
 
-    for i in range(1000):
-        t.send_message_everywhere()
-        await asyncio.sleep(0.3)
+    for l in load_profile:
+        for i in range(0, l['itherations']):
+            t.send_message_everywhere()
+            await asyncio.sleep(l['time_wait'])
+
     await asyncio.sleep(5)
     for c in t.connections:
         await c.get_connection().close()
-        with open(f'stats/{c.conn_id}','w+') as f:
-            f.write([','.join([c.log[key]['cnt'],
-                      c.log[key]['sent_at']-(c.log[key]['response_at'] if 'response_at' in c.log[key]  else c.log[key]['sent_at']),
-                      c.log[key]['state']]) for key in c.log])
-
+        with open(f'stats/{c.conn_id}.csv','w+') as f:
+            f.write('\n'.join([';'.join(
+                      [
+                      str(c.log[key]['cnt']),
+                      str(c.log[key]['sent_at']),
+                      str((c.log[key]['response_at'] if 'response_at' in c.log[key] else c.log[key]['sent_at'])-c.log[key]['sent_at']),
+                      str(c.log[key]['state']),
+                      str(c.log[key]['resp_cnt']),
+                      str(c.log[key]['resp_size'])
+                      ])
+                      for key in c.log]))
 
 
 asyncio.run(start_testing())
