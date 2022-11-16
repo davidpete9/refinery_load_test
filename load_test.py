@@ -29,64 +29,112 @@ exporter = PrometheusRemoteWriteMetricsExporter(
         "host": "aps-workspaces.us-east-1.amazonaws.com"
     }
 )
-reader = PeriodicExportingMetricReader(exporter, 1000)
+reader = PeriodicExportingMetricReader(exporter, 500)
 provider = MeterProvider(metric_readers=[reader])
 metrics.set_meter_provider(provider)
 meter = metrics.get_meter(__name__)
 
-
 OK_Message_Num = 1
 Late_Message_NUM = 0
+
 
 def get_late_raito(observer):
     global Late_Message_NUM
     global OK_Message_Num
     raito = Late_Message_NUM / OK_Message_Num
     Late_Message_NUM = 0
-    OK_Message_Num = 0
+    OK_Message_Num = 1
     yield Observation(raito, {})
 
+
 msg_sent_counter = meter.create_counter(
-    name="messages sent",
+    name="ws_messages_sent",
     description="number of messages",
-    unit="1",
 )
 
 msg_received_counter = meter.create_counter(
-    name="ws messages received",
+    name="ws_messages_received",
     description="number of messages",
-    unit="1",
 )
 
 ws_conn_counter = meter.create_up_down_counter(
-    name="ws connections open",
+    name="ws_connections_open",
     description="number of messages",
-    unit="1",
+)
+
+
+ws_send_gap = meter.create_up_down_counter(
+    name="ws_msg_send_gap",
+    description="",
+    unit="ms"
 )
 
 ws_errors = meter.create_counter(
-    name="ws errors",
+    name="ws_errors",
     description="Errors.",
-    unit="1"
 )
 
 late_raito = meter.create_observable_gauge(
     callbacks=[get_late_raito],
-    name="late message raito",
+    name="ws_late_message_raito",
     description="",
     unit="1"
 )
 
-resp_time_hg = meter.create_histogram(
-    name="Response time",
-    description="Response time of messages",
-    unit="1"
+
+class MetricAggregator:
+
+    def __init__(self):
+        self.log = dict()  # dict( value_type=[val1,val2,...], ... )
+        self.val_props = dict()  # dict(value_type=('avg',cnt) ..)
+
+    def init_value_type(self, type_name, strategy='avg'):
+        self.val_props[type_name] = [strategy, 0]
+        self.log[type_name] = []
+
+    def observe(self, val_type):
+        strat = self.val_props[val_type][0]
+        if strat == 'avg':
+            res = (sum(self.log[val_type]) / self.val_props[val_type][1]) if self.val_props[val_type][1] > 0 else 0 
+        else:
+            res = self.log[val_type][-1]
+        self.val_props[val_type][1] = 0
+        self.log[val_type] = []
+
+        return res
+
+    def add_value(self, val_type, val):
+        self.log[val_type].append(val)
+        self.val_props[val_type][1] += 1  # increase the count
+
+
+aggregator = MetricAggregator()
+aggregator.init_value_type('resp_time')
+aggregator.init_value_type('resp_size')
+
+
+def get_resp_time(observer):
+    res = aggregator.observe('resp_time')
+    yield Observation(res, {'name': 'ws_resp_time'})
+
+
+def get_resp_size(observer):
+    res = aggregator.observe('resp_size')
+    yield Observation(res, {'name': 'ws_resp_size'})
+
+
+meter.create_observable_gauge(
+    callbacks=[get_resp_time],
+    name="ws_msg_resp_time",
+    description="",
+    unit="ms"
 )
 
-resp_size_hg = meter.create_histogram(
-    name="Response size",
-    description="Response size of messages",
-    unit="1"
+meter.create_observable_gauge(
+    callbacks=[get_resp_size],
+    name="ws_msg_resp_size",
+    description="",
+    unit="bytes"
 )
 
 
@@ -173,18 +221,14 @@ class ConnectionHandler:
                 if self.cnt != self.log[obj['id']]['cnt'] + 1:
                     global Late_Message_NUM
                     Late_Message_NUM += 1
-                    self.log[obj['id']]['state'] = 'late'
                 else:
                     global OK_Message_Num
                     OK_Message_Num += 1
-                    self.log[obj['id']]['state'] = 'OK'
+                    
                 self.log[obj['id']]['response_at'] = arrived_at
-                resp_time_hg.record(arrived_at - self.log[obj['id']]['sent_at'])
-                self.log[obj['id']]['resp_cnt'] = self.log[obj['id']]['resp_cnt'] + 1 \
-                    if 'resp_cnt' in self.log[obj['id']] else 1
-                self.log[obj['id']]['resp_size'] = self.log[obj['id']]['resp_size'] + len(message) \
-                    if 'resp_size' in self.log[obj['id']] else len(message)
-                resp_size_hg.record(self.log[obj['id']]['resp_size'])
+                aggregator.add_value('resp_time', arrived_at - self.log[obj['id']]['sent_at'])
+                del self.log[obj['id']]
+                aggregator.add_value('resp_size', len(message))
         except Exception as e:
             pass
 
@@ -208,8 +252,8 @@ class StressTester:
                 await self.connections[i].close_connection()
         if self.conn_count < conn_num:
             await self.init_connections(conn_num - self.conn_count)
+        ws_conn_counter.add(conn_num-self.conn_count)
         self.conn_count = conn_num
-        ws_conn_counter.add(conn_num)
 
     def __init__(self, ws_url, num_of_connections):
         self.url = ws_url
@@ -223,7 +267,7 @@ class StressTester:
 
 WS_URL = 'wss://xtext.test.refinery.services/xtext-service'
 
-load_profile = [dict(time_wait=1, itherations=1, conns=1), dict(time_wait=0.5, itherations=1, conns=2)]
+load_profile = [dict(time_wait=0.3, itherations=100, conns=10), dict(time_wait=0.3, itherations=100, conns=20),dict(time_wait=0.3, itherations=100, conns=40)]
 
 
 def get_stats(handlers):
@@ -242,7 +286,10 @@ def get_stats(handlers):
 
 async def start_testing():
     t = StressTester(WS_URL, 0)
+    recent_ws_gap = 0
     for l in load_profile:
+        ws_send_gap.add(l['time_wait']-recent_ws_gap)
+        recent_ws_gap = l['time_wait']
         print('Running load profile: time_between = {}  itherations = {} conns =  {}'.format(l['time_wait'],
                                                                                              l['itherations'],
                                                                                              l['conns']))
@@ -256,17 +303,6 @@ async def start_testing():
     get_stats(t.connections)
     for c in t.connections:
         await c.get_connection().close()
-        # with open(f'stats/{c.conn_id}.csv','w+') as f:
-        #    f.write('\n'.join([';'.join(
-        #              [
-        #              str(c.log[key]['cnt']),
-        #              str(c.log[key]['sent_at']),
-        #              str((c.log[key]['response_at'] if 'response_at' in c.log[key] else c.log[key]['sent_at'])-c.log[key]['sent_at']),
-        #              str(c.log[key]['state']),
-        #              str(c.log[key]['resp_cnt']),
-        #              str(c.log[key]['resp_size'])
-        #              ])
-        #              for key in c.log]))
 
 
 asyncio.run(start_testing())
