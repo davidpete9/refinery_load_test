@@ -29,7 +29,7 @@ exporter = PrometheusRemoteWriteMetricsExporter(
         "host": "aps-workspaces.us-east-1.amazonaws.com"
     }
 )
-reader = PeriodicExportingMetricReader(exporter, 500)
+reader = PeriodicExportingMetricReader(exporter, 1000)
 provider = MeterProvider(metric_readers=[reader])
 metrics.set_meter_provider(provider)
 meter = metrics.get_meter(__name__)
@@ -138,6 +138,11 @@ meter.create_observable_gauge(
 )
 
 
+resp_hg = meter.create_histogram(
+    name="ws_resp_time_histogram",
+    description=""
+)
+
 def get_full_sample(problem_predix):
     with open('sample.txt', 'r') as f:
         content = f.read()
@@ -197,10 +202,12 @@ class ConnectionHandler:
             self.close_reason = 'server_closed'
             self.log[next_message['id']]['state'] = 'server_closed'
             self.is_closed = True
+            ws_conn_counter.add(-1)
             ws_errors.add(1)
         except ConnectionClosedError as e:
             print('Connection closed error {}'.format(e.reason))
             self.is_closed = True
+            ws_conn_counter.add(-1)
             self.close_reason = 'client_closed'
             self.log[next_message['id']]['state'] = 'client_closed'
         finally:
@@ -226,7 +233,9 @@ class ConnectionHandler:
                     OK_Message_Num += 1
                     
                 self.log[obj['id']]['response_at'] = arrived_at
-                aggregator.add_value('resp_time', arrived_at - self.log[obj['id']]['sent_at'])
+                resp_time = arrived_at - self.log[obj['id']]['sent_at']
+                aggregator.add_value('resp_time', resp_time)
+                resp_hg.record(resp_time)
                 del self.log[obj['id']]
                 aggregator.add_value('resp_size', len(message))
         except Exception as e:
@@ -267,7 +276,7 @@ class StressTester:
 
 WS_URL = 'wss://xtext.test.refinery.services/xtext-service'
 
-load_profile = [dict(time_wait=0.3, itherations=100, conns=10), dict(time_wait=0.3, itherations=100, conns=20),dict(time_wait=0.3, itherations=100, conns=40)]
+load_profile = [dict(time_wait=0.4, itherations=100, conns=40), dict(time_wait=0.4, itherations=100, conns=50),dict(time_wait=0.4, itherations=100,conns=70)]
 
 
 def get_stats(handlers):
@@ -293,7 +302,7 @@ async def start_testing():
         print('Running load profile: time_between = {}  itherations = {} conns =  {}'.format(l['time_wait'],
                                                                                              l['itherations'],
                                                                                              l['conns']))
-        await t.update_connection_num(l['conns'])
+        asyncio.create_task(t.update_connection_num(l['conns']))
         for i in range(0, l['itherations']):
             t.send_message_everywhere()
             await asyncio.sleep(l['time_wait'])
